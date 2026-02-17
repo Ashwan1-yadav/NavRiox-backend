@@ -10,9 +10,11 @@ This document describes the NavRiox backend for frontend developers: how to call
 - **Database**: MongoDB (via Mongoose)
 - **Auth**: JWT (HTTP-only cookies)
 - **Payments**: Razorpay (orders + webhooks)
+- **Security**: Helmet, CORS, Rate Limiting
 - **Base URL (local)**: `http://localhost:PORT`
   - **Default start command**: `npm run dev`
   - **Main entry**: `src/server.js`
+  - **App config**: `src/app.js` (middleware, routes)
 
 ---
 
@@ -38,8 +40,7 @@ src/
       auth.service.js    # Business logic for register/login
     payment/
       payment.routes.js  # /api/payment endpoints
-      payment.controller.js
-      payment.service.js # Razorpay order creation
+      payment.controller.js # Razorpay order creation & payment handling
       payment.webhook.js # Razorpay webhook handler
   utils/
     hash.js              # Password hashing/comparison
@@ -58,7 +59,11 @@ src/
   - Protected routes use middleware `protect` (`src/middleware/auth.middleware.js`), which:
     - Reads `accessToken` cookie.
     - Verifies via `JWT_ACCESS_SECRET`.
-    - Sets `req.user` to the decoded user payload.
+    - Sets `req.user` to the decoded user payload (contains `id` and `role`).
+    - Returns `401` with `"Unauthorized"` if token is missing, or `"Token expired or invalid"` if verification fails.
+- **Token Details**:
+  - **Access token**: Expires in 15 minutes, payload: `{ id: user._id, role: user.role }`
+  - **Refresh token**: Expires in 7 days, payload: `{ id: user._id }`, hashed and stored in `User.refreshToken`
 - **Frontend implication**:
   - You **don’t** need to manually attach Authorization headers.
   - Just make sure requests are sent with `credentials: "include"` so cookies are sent.
@@ -128,10 +133,10 @@ Base path for all auth routes: ` /api/auth`
 - **User Flow** (high level):
   1. User logs in (gets cookies).
   2. Frontend calls `POST /api/payment/create-order` with the desired amount.
-  3. Backend creates Razorpay order with `notes.userId` attached.
+  3. Backend creates Razorpay order and immediately creates a `Payment` record with status `"created"`.
   4. Frontend uses Razorpay Checkout with returned order.
-  5. Razorpay calls backend webhook `/api/payment/webhook` when payment is captured/failed.
-  6. Backend persists `Payment` record and updates `User.subscription`.
+  5. Razorpay calls backend webhook `/api/payment/webhook` when payment is captured.
+  6. Backend updates the existing `Payment` record with `paymentId` and sets status to `"paid"`.
 
 ### Payment Routes
 
@@ -152,30 +157,47 @@ Base path for all payment routes: `/api/payment`
 ```
 
 - **Backend Logic**:
-  - Calls `paymentService.createOrder(userId, amount)`.
-  - Creates an order in Razorpay with:
-    - `amount * 100` (paise),
+  - Extracts `userId` from `req.user.id` (set by `protect` middleware).
+  - Creates a Razorpay order with:
+    - `amount * 100` (converts to paise),
     - `currency: "INR"`,
-    - `notes.userId` = current user id.
+    - `receipt: "receipt_<timestamp>"`.
+  - Immediately creates a `Payment` record in the database with:
+    - `user`: userId (ObjectId reference),
+    - `orderId`: Razorpay order id,
+    - `amount`: original amount (not in paise),
+    - `currency`: "INR",
+    - `status`: "created".
 - **Success Response (200)**:
-  - Directly returns the Razorpay order object (shape from Razorpay SDK), for example:
 
 ```json
 {
-  "id": "order_XXXX",
-  "amount": 49900,
-  "currency": "INR",
-  "receipt": "receipt_1739697770000",
-  "status": "created",
-  "notes": {
-    "userId": "65f..."
+  "success": true,
+  "message": "Order created successfully",
+  "order": {
+    "id": "order_XXXX",
+    "amount": 49900,
+    "currency": "INR",
+    "receipt": "receipt_1739697770000",
+    "status": "created"
+  },
+  "payment": {
+    "_id": "...",
+    "user": "65f...",
+    "orderId": "order_XXXX",
+    "amount": 499,
+    "currency": "INR",
+    "status": "created",
+    "createdAt": "...",
+    "updatedAt": "..."
   }
 }
 ```
 
 - **Error Cases**:
+  - `400` with `"Valid amount required"` if amount is missing or <= 0.
   - `401` if no/invalid `accessToken` cookie.
-  - `500` for Razorpay or server errors.
+  - `500` with error details for Razorpay or server errors.
 
 #### POST `/api/payment/webhook`
 
@@ -185,22 +207,14 @@ Base path for all payment routes: `/api/payment`
 - **Request Body**:
   - Raw Razorpay event payload, e.g. for `payment.captured` or `payment.failed`.
 
-- **Backend Logic (simplified)**:
-  - Verifies HMAC signature using `RAZORPAY_WEBHOOK_SECRET`.
-  - Ignores already processed events (`Payment.eventId` uniqueness).
-  - For `payment.captured`:
-    - Extracts payment info, especially:
-      - `paymentEntity.id` → `razorpayPaymentId`
-      - `paymentEntity.order_id` → `razorpayOrderId`
-      - `paymentEntity.amount`, `currency`
-      - `paymentEntity.notes.userId`
-    - Upserts `Payment` document.
-    - Finds `User` by `userId` and sets:
-      - `subscription.plan = "PRO"`
-      - `subscription.status = "ACTIVE"`
-      - `subscription.expiresAt = now + 1 month`
-  - For `payment.failed`:
-    - Creates a `Payment` record with `status = "FAILED"`.
+- **Backend Logic**:
+  - Verifies HMAC signature using `RAZORPAY_WEBHOOK_SECRET` by comparing `x-razorpay-signature` header with computed signature.
+  - For `payment.captured` event:
+    - Extracts payment data from `req.body.payload.payment.entity`.
+    - Finds existing `Payment` record by `orderId` (from `paymentData.order_id`).
+    - Updates the `Payment` record with:
+      - `paymentId`: `paymentData.id`
+      - `status`: `"paid"`
   - Always returns:
 
 ```json
@@ -210,10 +224,8 @@ Base path for all payment routes: `/api/payment`
 ```
 
 - **Error Cases**:
-  - `400` `"Missing signature"` if header is absent.
-  - `400` `"Invalid signature"` if HMAC mismatch.
-  - `400` `"UserId missing in notes"` if webhook data doesn’t contain notes.userId.
-  - `500` `"Internal webhook error"` on unhandled errors.
+  - `400` with `"Invalid signature"` if HMAC signature verification fails.
+  - `400` with `"Webhook failed"` on unhandled errors.
 
 ---
 
@@ -235,13 +247,14 @@ Key fields relevant to frontend:
 ### Payment Model (simplified)
 
 - **Payment**
-  - `razorpayOrderId: string`
-  - `razorpayPaymentId?: string`
-  - `userId: ObjectId<User>`
-  - `amount: number`
-  - `currency: string`
-  - `status: "CREATED" | "SUCCESS" | "FAILED"`
-  - `eventId: string` (Razorpay event id, unique)
+  - `user: ObjectId<User>` (reference to User model)
+  - `orderId: string` (Razorpay order ID, unique)
+  - `paymentId?: string` (Razorpay payment ID, set when payment is captured)
+  - `amount: number` (amount in rupees, not paise)
+  - `currency: string` (default: "INR")
+  - `status: "created" | "paid" | "failed"`
+  - `createdAt: Date`
+  - `updatedAt: Date`
 
 ---
 
@@ -257,8 +270,8 @@ Text description:
 4. **Open Razorpay Checkout** on frontend using returned order `id`.
 5. **Payment Success**:
    - Razorpay triggers webhook to `/api/payment/webhook` (`payment.captured`).
-   - Backend records payment + sets `user.subscription.plan = "PRO"`, `status = "ACTIVE"`, `expiresAt = now + 1 month`.
-6. **Frontend** can fetch the user profile (when that endpoint is added) and check `subscription` to show PRO features.
+   - Backend updates the existing `Payment` record with `paymentId` and sets `status = "paid"`.
+6. **Frontend** can fetch the user profile (when that endpoint is added) and check payment status.
 
 ### Sequence Diagram (Mermaid)
 
@@ -277,16 +290,17 @@ sequenceDiagram
 
   User->>FE: Click "Pay"
   FE->>BE: POST /api/payment/create-order (amount) [with cookies]
-  BE->>RZP: Create order (userId in notes)
+  BE->>BE: Create Payment record (status: "created")
+  BE->>RZP: Create order
   RZP-->>BE: Order details
-  BE-->>FE: Order details (id, amount, currency, notes.userId)
+  BE-->>FE: Order + Payment details
 
   FE->>RZP: Open Razorpay Checkout (orderId)
   RZP-->>User: Payment UI
   User->>RZP: Complete payment
 
   RZP->>BE: POST /api/payment/webhook (payment.captured)
-  BE->>BE: Verify signature, upsert Payment, update User.subscription to PRO/ACTIVE
+  BE->>BE: Verify signature, update Payment (paymentId, status: "paid")
   BE-->>RZP: { received: true }
 ```
 
@@ -326,7 +340,8 @@ async function createOrder(amount: number) {
     throw new Error("Failed to create order");
   }
 
-  return res.json(); // Razorpay order object
+  const data = await res.json();
+  return data; // { success, message, order, payment }
 }
 ```
 
@@ -354,5 +369,7 @@ For local development, define these in your `.env` file:
 - Always call backend with `credentials: "include"` after login so cookies are sent.
 - For local dev, configure your frontend dev server proxy to forward `/api/*` to the Node backend (to avoid CORS issues).
 - Treat `/api/payment/webhook` as **backend-only**; the frontend should never call it directly.
-- Subscription state is driven entirely by Razorpay webhooks and lives on the `User.subscription` object.
+- The backend uses rate limiting (100 requests per 15 minutes per IP) to prevent abuse.
+- CORS is configured to allow credentials; ensure your frontend origin is properly configured in production.
+- Payment records are created immediately when an order is created, and updated when payment is captured via webhook.
 
