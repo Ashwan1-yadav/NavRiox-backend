@@ -10,7 +10,10 @@ This document describes the NavRiox backend for frontend developers: how to call
 - **Database**: MongoDB (via Mongoose)
 - **Auth**: JWT (HTTP-only cookies)
 - **Payments**: Razorpay (orders + webhooks)
+- **Image Processing**: Sharp, Canvas (for passport photo generation)
+- **File Uploads**: Multer
 - **Security**: Helmet, CORS, Rate Limiting
+- **Logging**: Morgan
 - **Base URL (local)**: `http://localhost:PORT`
   - **Default start command**: `npm run dev`
   - **Main entry**: `src/server.js`
@@ -28,6 +31,7 @@ src/
   server.js              # Server bootstrap, DB connection
   config/
     db.js                # MongoDB connection
+    razorpay.js          # Razorpay client configuration
   middleware/
     auth.middleware.js   # JWT auth guard (protect)
   models/
@@ -42,9 +46,16 @@ src/
       payment.routes.js  # /api/payment endpoints
       payment.controller.js # Razorpay order creation & payment handling
       payment.webhook.js # Razorpay webhook handler
+    passport/
+      passport.routes.js # /api/passport endpoints
+      passport.controller.js # Passport photo generation handlers
+      passport.service.js # Business logic for passport processing
   utils/
     hash.js              # Password hashing/comparison
     jwt.js               # Access/refresh token generation
+    imageProcessor.js    # Image processing utilities (Sharp, Canvas)
+  uploads/               # Temporary storage for uploaded images
+  output/                # Generated passport photo sheets
 ```
 
 ---
@@ -229,6 +240,49 @@ Base path for all payment routes: `/api/payment`
 
 ---
 
+## Passport Photo Generation Overview
+
+- **Purpose**: Generate A4 sheets with 6 passport-sized photos from a user-uploaded image.
+- **Processing**:
+  - Resizes uploaded image to passport dimensions (390x480px)
+  - Applies background color (default: white)
+  - Arranges 6 photos on an A4 sheet (2480x3508px) with borders
+  - Returns the generated A4 sheet as a downloadable JPEG file
+
+### Passport Routes
+
+Base path for all passport routes: `/api/passport`
+
+#### POST `/api/passport/generate`
+
+- **Description**: Generates an A4 sheet with 6 passport photos from an uploaded image.
+- **Auth**: Public (no authentication required).
+- **Content-Type**: `multipart/form-data`
+- **Request Body (Form Data)**:
+  - `photo`: Image file (required) - The photo to be processed
+  - `bgColor`: String (optional) - Background color in hex format (default: `"#ffffff"`)
+
+- **Backend Logic**:
+  - Accepts image file via Multer middleware
+  - Processes image using Sharp:
+    - Resizes to passport dimensions (390x480px)
+    - Applies background color
+  - Creates A4 canvas using Canvas library
+  - Arranges 6 photos horizontally with black borders
+  - Saves output to `src/output/` directory
+  - Returns the generated file as download
+
+- **Success Response (200)**:
+  - **Content-Type**: `image/jpeg` or `application/octet-stream`
+  - **Body**: Binary file (A4 sheet with 6 passport photos)
+  - **Headers**: `Content-Disposition: attachment; filename="a4-<timestamp>.jpg"`
+
+- **Error Cases**:
+  - `400` with `{ success: false, message: "Photo is required" }` if no file is uploaded.
+  - `500` with `{ success: false, message: "Passport generation failed" }` on processing errors.
+
+---
+
 ## User & Payment Data Shapes
 
 ### User Model (simplified)
@@ -345,6 +399,39 @@ async function createOrder(amount: number) {
 }
 ```
 
+### Generate Passport Photos (fetch with FormData)
+
+```ts
+async function generatePassportPhoto(file: File, bgColor?: string) {
+  const formData = new FormData();
+  formData.append("photo", file);
+  if (bgColor) {
+    formData.append("bgColor", bgColor);
+  }
+
+  const res = await fetch("/api/passport/generate", {
+    method: "POST",
+    credentials: "include",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    throw new Error("Failed to generate passport photos");
+  }
+
+  // Handle file download
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `passport-${Date.now()}.jpg`;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+}
+```
+
 ---
 
 ## Environment Variables
@@ -372,4 +459,9 @@ For local development, define these in your `.env` file:
 - The backend uses rate limiting (100 requests per 15 minutes per IP) to prevent abuse.
 - CORS is configured to allow credentials; ensure your frontend origin is properly configured in production.
 - Payment records are created immediately when an order is created, and updated when payment is captured via webhook.
+- For passport photo generation:
+  - Use `FormData` to send image files (don't set `Content-Type` header, browser will set it automatically with boundary).
+  - The endpoint returns a binary file (JPEG), so handle it as a blob for download.
+  - Background color is optional; if not provided, defaults to white (`#ffffff`).
+  - Uploaded files are temporarily stored in `src/uploads/` and processed files in `src/output/`.
 

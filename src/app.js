@@ -33,8 +33,9 @@ app.use(
 
 app.use("/api/auth", require("./modules/auth/auth.routes"));
 app.use("/api/payment", require("./modules/payment/payment.routes"));
+app.use("/api/passport", require("./modules/passport/passport.routes"));
 
-app.get("/", (req, res) => {
+app.get("/", (_, res) => {
   res.send("Navriox Backend API is up and running");
 });
 
